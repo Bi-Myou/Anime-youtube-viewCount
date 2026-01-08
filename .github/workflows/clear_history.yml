@@ -1,0 +1,30 @@
+name: Auto Clear Git History
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  reset-history:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 抓取完整歷史以便處理
+      - name: Reset History
+        run: |
+          # 設定使用者身分
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # 切換到孤兒分支 (無歷史紀錄的分支)
+          git checkout --orphan temp_branch
+          # 加入當前所有檔案
+          git add -A
+          # 提交
+          git commit -m "Clean history reset"
+          # 刪除舊的 main 分支
+          git branch -D main
+          # 將當前分支改名為 main
+          git branch -m main
+          # 強制推送到遠端 (覆蓋歷史)
+          git push -f origin main

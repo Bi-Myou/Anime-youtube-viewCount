@@ -1,0 +1,41 @@
+name: 日本動畫 Youtube亞洲新番觀看量
+
+on:
+  schedule:
+    # 每天 UTC 13:00 (台灣時間 21:00) 執行
+    - cron: '0 13 * * *'
+  
+  # 允許手動觸發 (方便測試)
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: '執行觀看量統計'
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.13'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    - name: '執行記錄'
+      env:
+        GAS_KEY: ${{ secrets.GAS_KEY }}
+        YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN_WM }}
+        TG_CHAT_ID: ${{ secrets.TG_CHAT_ID_WM_TRASH }}
+        HEARTBEAT_URL: ${{ secrets.HEARTBEAT_URL }}
+        SPREADSHEET_ID_MUSE: ${{ secrets.SPREADSHEET_ID_MUSE }}
+        SPREADSHEET_ID_MEDIALINK: ${{ secrets.SPREADSHEET_ID_MEDIALINK }}
+        SPREADSHEET_ID_TROPIC: ${{ secrets.SPREADSHEET_ID_TROPIC }}
+      run: |
+        python yt_view_count.py
