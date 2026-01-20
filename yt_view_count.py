@@ -88,6 +88,10 @@ class YouTubeDataProcessor:
         # 忽略關鍵字清單
         self.ignore_keywords = ["預告", "PV", "NCED", "NCOP", "OP", "ED", "Creditless", "Trailer", "Teaser", "Recap", "Special", "特別篇", "總集篇", "全集馬拉松",
                                 "Semua Episode", "Chia sẻ của DV lồng tiếng", "CM", "第二季製作決定"]
+        # 有例外動畫名稱的關鍵字
+        self.ignore_keywords_exceptions = {
+            "CM": ["testCM動畫名稱"]
+        }
         self.youtube_base_url = "https://www.googleapis.com/youtube/v3"
 
     def _check_quota(self, response):
@@ -284,6 +288,12 @@ class YouTubeDataProcessor:
     def is_ignored_keyword(self, title):
         """檢查是否包含忽略關鍵字"""
         for kw in self.ignore_keywords:
+            # 如果這個關鍵字有例外，且 title 包含例外名稱，就不忽略
+            if kw in self.ignore_keywords_exceptions:
+                exceptions = self.ignore_keywords_exceptions[kw]
+                if any(exc in title for exc in exceptions):
+                    continue
+            # 如果 title 包含關鍵字，就忽略
             if kw in title:
                 return True
         return False
