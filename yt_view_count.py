@@ -87,7 +87,7 @@ class YouTubeDataProcessor:
         self.quota_exceeded = False
         # 忽略關鍵字清單
         self.ignore_keywords = ["預告", "PV", "NCED", "NCOP", "OP", "ED", "Creditless", "Trailer", "Teaser", "Recap", "Special", "特別篇", "總集篇", "全集馬拉松",
-                                "Semua Episode", "Chia sẻ của DV lồng tiếng"]
+                                "Semua Episode", "Chia sẻ của DV lồng tiếng", "CM", "第二季製作決定"]
         self.youtube_base_url = "https://www.googleapis.com/youtube/v3"
 
     def _check_quota(self, response):
