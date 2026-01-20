@@ -87,7 +87,7 @@ class YouTubeDataProcessor:
         self.quota_exceeded = False
         # 忽略關鍵字清單
         self.ignore_keywords = ["預告", "PV", "NCED", "NCOP", "OP", "ED", "Creditless", "Trailer", "Teaser", "Recap", "Special", "特別篇", "總集篇", "全集馬拉松",
-                                "Semua Episode", "Chia sẻ của DV lồng tiếng", "CM", "第二季製作決定"]
+                                "Semua Episode", "Chia sẻ của DV lồng tiếng", "CM", "第二季製作決定", "精華重溫", "Preview"]
         # 有例外動畫名稱的關鍵字
         self.ignore_keywords_exceptions = {
             "CM": ["testCM動畫名稱"]
