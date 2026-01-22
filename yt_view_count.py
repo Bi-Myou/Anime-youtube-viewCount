@@ -664,7 +664,7 @@ def main():
             if today_key in schedule:
                 sheets_to_process.update(schedule[today_key])
                 
-            target_sheets = sorted(list(sheets_to_process))
+            target_sheets = sorted([str(s) for s in sheets_to_process])
 
             if not target_sheets:
                 print("此試算表今天沒有安排需要更新的工作表。")
