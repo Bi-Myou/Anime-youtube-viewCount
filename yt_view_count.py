@@ -488,7 +488,7 @@ def process_single_sheet(sheet_name):
                 region_results.append({"anime": anime, "stats": None})
                 continue
 
-            print(f"總={stats['total']}, 均={stats['avg']}, 首={stats['first']}")
+            print(f"總={stats['total']}, 均={stats['avg']}, 首={stats['first']}, 集={stats.get('valid_count', 0)}")
             region_results.append({"anime": anime, "stats": stats})
 
             # 累加平均流量至全域 Map
