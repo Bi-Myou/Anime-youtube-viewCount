@@ -1,0 +1,27 @@
+name: keepalive
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'   # 每月1號 UTC 00:00
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update heartbeat
+        run: |
+          echo "$(date -u)" > .github/heartbeat.txt
+
+      - name: Commit (if changed)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .github/heartbeat.txt
+          git commit -m "chore: keepalive" || exit 0
+          git push
