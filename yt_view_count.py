@@ -358,9 +358,25 @@ class YouTubeDataProcessor:
 
         if not valid_videos:
             return result # 過濾後無影片
+        
+        # 去重複影片（依 video id）
+        unique_videos = {}
+        for v in valid_videos:
+            vid = v['id']
+            if vid not in unique_videos:
+                unique_videos[vid] = v
+        valid_videos = list(unique_videos.values())
 
         # 6. 取得播放次數
         video_ids = [v['id'] for v in valid_videos]
+        # # 去除重複影片 (依 video id)
+        # unique_videos = {}
+        # for v in valid_videos:
+        #     vid = v['id']
+        #     if vid not in unique_videos:
+        #         unique_videos[vid] = v
+        # valid_videos = list(unique_videos.values())
+        # video_ids = list(unique_videos.keys())
         stats = self.get_video_stats(video_ids)
 
         if self.quota_exceeded: return None
