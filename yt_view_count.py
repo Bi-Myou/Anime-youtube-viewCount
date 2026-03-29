@@ -316,6 +316,9 @@ class YouTubeDataProcessor:
         if offset_str:
             try:
                 offset_range = json.loads(offset_str)
+                # 排除不是是 [XX, YY] 的內容
+                if offset_str.strip()[0] != "[":
+                    offset_string = offset_str
             except:
                 offset_string = offset_str
                 # pass # 解析失敗則忽略 offset
@@ -367,9 +370,9 @@ class YouTubeDataProcessor:
                 continue
 
             # 4. Offset 過濾
-            if offset_range and not self.is_in_offset(title, offset_range=offset_range):
-                continue
             if offset_string and not self.is_in_offset(title, offset_string=offset_string):
+                continue
+            if offset_range and not self.is_in_offset(title, offset_range=offset_range):
                 continue
 
             valid_videos.append(item)
