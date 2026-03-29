@@ -395,6 +395,10 @@ class YouTubeDataProcessor:
         valid_videos = list(unique_videos.values())
         video_ids = [v['id'] for v in valid_videos]
         stats = self.get_video_stats(video_ids)
+        # 過濾不存在 / private / deleted 影片
+        valid_videos = [v for v in valid_videos if v['id'] in stats]
+        if not valid_videos:
+            return result
 
         if self.quota_exceeded: return None
 
