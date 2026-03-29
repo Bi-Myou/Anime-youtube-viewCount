@@ -15,7 +15,9 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID_WM_TRASH")
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL")
 
 SPREADSHEET_IDS = [
-    os.environ.get("SPREADSHEET_ID_MEDIALINK", "")
+    os.environ.get("SPREADSHEET_ID_MUSE", ""),
+    os.environ.get("SPREADSHEET_ID_MEDIALINK", ""),
+    os.environ.get("SPREADSHEET_ID_TROPIC", "")
 ]
 TZ_UTC_PLUS_8 = timezone(timedelta(hours=8))
 
