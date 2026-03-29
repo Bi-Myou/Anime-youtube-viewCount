@@ -15,9 +15,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID_WM_TRASH")
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL")
 
 SPREADSHEET_IDS = [
-    os.environ.get("SPREADSHEET_ID_MUSE", ""),
-    os.environ.get("SPREADSHEET_ID_MEDIALINK", ""),
-    os.environ.get("SPREADSHEET_ID_TROPIC", "")
+    os.environ.get("SPREADSHEET_ID_MEDIALINK", "")
 ]
 TZ_UTC_PLUS_8 = timezone(timedelta(hours=8))
 
@@ -365,14 +363,14 @@ class YouTubeDataProcessor:
         for item in all_items:
             title = item['title']
 
-            # 5. 關鍵字過濾
-            if self.is_ignored_keyword(title):
-                continue
-
             # 4. Offset 過濾
             if offset_string and not self.is_in_offset(title, offset_string=offset_string):
                 continue
             if offset_range and not self.is_in_offset(title, offset_range=offset_range):
+                continue
+
+            # 5. 關鍵字過濾（但如果有 offset_string → 不套用）
+            if not offset_string and self.is_ignored_keyword(title):
                 continue
 
             valid_videos.append(item)
