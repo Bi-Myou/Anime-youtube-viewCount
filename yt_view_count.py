@@ -371,8 +371,8 @@ class YouTubeDataProcessor:
             if offset_range and not self.is_in_offset(title, offset_range=offset_range):
                 continue
 
-            # 5. 關鍵字過濾（但如果有 offset_string → 不套用）
-            if not offset_string and self.is_ignored_keyword(title):
+            # 5. 關鍵字過濾（只在完全沒設定 offset 時才套用）
+            if not offset_string and not offset_range and self.is_ignored_keyword(title):
                 continue
 
             valid_videos.append(item)
