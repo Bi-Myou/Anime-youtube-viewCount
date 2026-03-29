@@ -302,7 +302,12 @@ class YouTubeDataProcessor:
         """處理單一動畫的邏輯"""
         if self.quota_exceeded: return None
 
+        link_urls = anime_item.get('link_urls') or []
         link_url = anime_item.get('link_url')
+
+        # 相容舊資料
+        if not link_urls and link_url:
+            link_urls = [link_url]
         offset_str = anime_item.get('offset')
 
         # 解析 Offset 字串 "[0,11]" -> [0, 11]
@@ -315,8 +320,6 @@ class YouTubeDataProcessor:
                 offset_string = offset_str
                 # pass # 解析失敗則忽略 offset
 
-        playlist_id = self.get_playlist_id(link_url)
-
         # 初始化回傳值
         result = {
             "avg": "---",
@@ -326,22 +329,37 @@ class YouTubeDataProcessor:
             "ep_count_update": None # 可選：是否要更新總集數
         }
 
-        if not playlist_id:
+        if not link_urls:
+            return None
+
+        all_items = []
+        has_valid_playlist = False
+
+        for url in link_urls:
+            playlist_id = self.get_playlist_id(url)
             # 沒有連結或連結錯誤，視為下架或無效 (依需求這裡可能不填寫，或是填 ---)
-            return None # 不做動作
+            if not playlist_id:
+                continue  # 不做動作
 
-        # 3. 取得播放清單
-        items = self.get_playlist_items(playlist_id)
+            has_valid_playlist = True
+            # 3. 取得播放清單
+            items = self.get_playlist_items(playlist_id)
 
-        if items == "REMOVED":
-            return {k: "已下架" for k in result}
+            if items == "REMOVED":
+                continue
 
-        if not items:
-            return result # 全空 "---"
+            if items:
+                all_items.extend(items)
+
+        if not has_valid_playlist:
+            return None
+
+        if not all_items:
+            return result
 
         # 4 & 5. 過濾影片
         valid_videos = []
-        for item in items:
+        for item in all_items:
             title = item['title']
 
             # 5. 關鍵字過濾
@@ -368,15 +386,14 @@ class YouTubeDataProcessor:
         valid_videos = list(unique_videos.values())
 
         # 6. 取得播放次數
+        # 去除重複影片 (依 video id)
+        unique_videos = {}
+        for v in valid_videos:
+            vid = v['id']
+            if vid not in unique_videos:
+                unique_videos[vid] = v
+        valid_videos = list(unique_videos.values())
         video_ids = [v['id'] for v in valid_videos]
-        # # 去除重複影片 (依 video id)
-        # unique_videos = {}
-        # for v in valid_videos:
-        #     vid = v['id']
-        #     if vid not in unique_videos:
-        #         unique_videos[vid] = v
-        # valid_videos = list(unique_videos.values())
-        # video_ids = list(unique_videos.keys())
         stats = self.get_video_stats(video_ids)
 
         if self.quota_exceeded: return None
