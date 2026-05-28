@@ -18,8 +18,8 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID_WM_TRASH")
 HEARTBEAT_URL = os.getenv("HEARTBEAT_URL")
 
 SPREADSHEET_IDS = [
-    os.environ.get("SPREADSHEET_ID_MUSE", ""),
-    os.environ.get("SPREADSHEET_ID_MEDIALINK", ""),
+    # os.environ.get("SPREADSHEET_ID_MUSE", ""),
+    # os.environ.get("SPREADSHEET_ID_MEDIALINK", ""),
     os.environ.get("SPREADSHEET_ID_TROPIC", ""),
 ]
 TZ_UTC_PLUS_8 = timezone(timedelta(hours=8))
@@ -51,7 +51,7 @@ class RegionDefinition:
     total_col: Optional[int]
     first_col: Optional[int]
     link_col: Optional[int]
-    offset_col: Optional[int]
+    offset_cols: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +61,7 @@ class RegionRowData:
     anime_name: str
     link_urls: List[str]
     offset_raw: Optional[str]
+    offset_col: Optional[int]
 
     @property
     def rank_cell(self) -> Optional[str]:
@@ -80,7 +81,7 @@ class RegionRowData:
 
     @property
     def offset_cell(self) -> Optional[str]:
-        return make_a1(self.definition.offset_col, self.row_num)
+        return make_a1(self.offset_col, self.row_num)
 
 
 @dataclass
@@ -88,7 +89,7 @@ class AnimeRow:
     row_num: int
     anime_name: str
     row_signature: str
-    ep_count_cell: str
+    ep_count_cell: Optional[str]
     comp_rank_cell: Optional[str]
     regions: Dict[str, RegionRowData]
 
@@ -96,6 +97,9 @@ class AnimeRow:
 @dataclass
 class SheetModel:
     sheet_name: str
+    name_col: int
+    ep_count_col: Optional[int]
+    comp_rank_col: Optional[int]
     regions: List[RegionDefinition]
     rows: List[AnimeRow]
 
@@ -665,37 +669,81 @@ def make_a1(col_num, row_num):
     return f"{letters}{row_num}"
 
 
-def detect_regions(row1, row2):
-    """依真實表格格式解析所有國家/區域區塊"""
-    regions = []
-    last_col = min(len(row1), len(row2))
-    col = 5
+def detect_note_col(row1):
+    """找出備註欄位置，用來界定最後一個區塊的結束範圍"""
+    for col_idx, value in enumerate(row1, start=1):
+        if "備註" in str(value):
+            return col_idx
+    return None
 
-    while col <= last_col:
-        header = str(row1[col - 1]).strip()
+
+def detect_name_col(row1):
+    """找出作品名稱欄；若缺失則保守退回 A 欄"""
+    for col_idx, value in enumerate(row1, start=1):
+        if str(value).strip() == "作品名稱":
+            return col_idx
+    return 1
+
+
+def detect_ep_count_col(row1):
+    """找出總集數欄"""
+    for col_idx, value in enumerate(row1, start=1):
+        if str(value).strip() == "總集數":
+            return col_idx
+    return None
+
+
+def detect_regions(row1, row2):
+    """依 row1 / row2 標題動態解析所有國家/區域區塊"""
+    last_col = min(len(row1), len(row2))
+    note_col = detect_note_col(row1) or (last_col + 1)
+
+    region_starts = []
+    for col_idx in range(1, min(last_col, note_col - 1) + 1):
+        if str(row2[col_idx - 1]).strip() == "排名":
+            region_starts.append(col_idx)
+
+    regions = []
+    for idx, start_col in enumerate(region_starts):
+        end_col = (region_starts[idx + 1] - 1) if idx + 1 < len(region_starts) else (note_col - 1)
+        header = str(row1[start_col - 1]).strip()
         if not header:
-            col += 1
-            continue
-        if "備註" in header:
-            break
-        if str(row2[col - 1]).strip() != "排名":
-            # 避免遇到意外欄位時整體偏移，逐欄往後找下一個合法區塊
-            col += 1
-            continue
+            header = f"REGION_{start_col}"
+
+        rank_col = None
+        avg_col = None
+        total_col = None
+        first_col = None
+        link_col = None
+        offset_cols = []
+
+        for col_idx in range(start_col, min(end_col, last_col) + 1):
+            label = str(row2[col_idx - 1]).strip()
+            if label == "排名" and rank_col is None:
+                rank_col = col_idx
+            elif label == "平均觀看" and avg_col is None:
+                avg_col = col_idx
+            elif label == "總觀看量" and total_col is None:
+                total_col = col_idx
+            elif label == "首集觀看" and first_col is None:
+                first_col = col_idx
+            elif label == "連結" and link_col is None:
+                link_col = col_idx
+            elif label == "OFFSET":
+                offset_cols.append(col_idx)
 
         regions.append(
             RegionDefinition(
                 name=header,
-                start_col=col,
-                rank_col=col,
-                avg_col=col + 1,
-                total_col=col + 2,
-                first_col=col + 3,
-                link_col=col + 4,
-                offset_col=col + 5,
+                start_col=start_col,
+                rank_col=rank_col,
+                avg_col=avg_col,
+                total_col=total_col,
+                first_col=first_col,
+                link_col=link_col,
+                offset_cols=offset_cols,
             )
         )
-        col += DEFAULT_REGION_BLOCK_SIZE
 
     return regions
 
@@ -714,13 +762,16 @@ def parse_sheet_snapshot(sheet_name, snapshot):
     row1 = snapshot.get("row1", [])
     row2 = snapshot.get("row2", [])
     rows_payload = snapshot.get("rows", [])
+    name_col = detect_name_col(row1)
+    ep_count_col = detect_ep_count_col(row1)
     regions = detect_regions(row1, row2)
     comp_rank_col = detect_comp_rank_col(row1)
 
     rows = []
     for row_payload in rows_payload:
         values = row_payload.get("values", [])
-        anime_name = str(values[0]).strip() if values and values[0] is not None else ""
+        anime_value = values[name_col - 1] if len(values) >= name_col and name_col > 0 else ""
+        anime_name = str(anime_value).strip() if anime_value is not None else ""
         if not anime_name:
             continue
 
@@ -729,13 +780,25 @@ def parse_sheet_snapshot(sheet_name, snapshot):
         region_map = {}
         for region in regions:
             # OFFSET 的作用域是「單一區塊單一儲存格」
-            offset_raw = values[region.offset_col - 1] if region.offset_col and len(values) >= region.offset_col else None
+            selected_offset_col = region.offset_cols[0] if region.offset_cols else None
+            offset_raw = None
+            for offset_col in region.offset_cols:
+                if len(values) < offset_col:
+                    continue
+                candidate = values[offset_col - 1]
+                if candidate not in (None, ""):
+                    selected_offset_col = offset_col
+                    offset_raw = candidate
+                    break
+            if offset_raw is None and selected_offset_col and len(values) >= selected_offset_col:
+                offset_raw = values[selected_offset_col - 1]
             region_map[region.name] = RegionRowData(
                 definition=region,
                 row_num=row_num,
                 anime_name=anime_name,
                 link_urls=link_urls_by_col.get(str(region.link_col), []),
                 offset_raw=offset_raw,
+                offset_col=selected_offset_col,
             )
 
         rows.append(
@@ -743,13 +806,20 @@ def parse_sheet_snapshot(sheet_name, snapshot):
                 row_num=row_num,
                 anime_name=anime_name,
                 row_signature=row_payload.get("row_signature", ""),
-                ep_count_cell=make_a1(4, row_num),
+                ep_count_cell=make_a1(ep_count_col, row_num),
                 comp_rank_cell=make_a1(comp_rank_col, row_num),
                 regions=region_map,
             )
         )
 
-    return SheetModel(sheet_name=sheet_name, regions=regions, rows=rows)
+    return SheetModel(
+        sheet_name=sheet_name,
+        name_col=name_col,
+        ep_count_col=ep_count_col,
+        comp_rank_col=comp_rank_col,
+        regions=regions,
+        rows=rows,
+    )
 
 
 def init_row_updates(rows):
