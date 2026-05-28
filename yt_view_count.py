@@ -33,7 +33,7 @@ DEFAULT_REGION_BLOCK_SIZE = 6
 # ==========================================
 @dataclass
 class OffsetRule:
-    match: Optional[str] = None
+    match_keywords: List[str] = field(default_factory=list)
     offset_range: Optional[Tuple[float, float]] = None
     include_keywords: List[str] = field(default_factory=list)
     exclude_keywords: List[str] = field(default_factory=list)
@@ -406,7 +406,8 @@ class YouTubeDataProcessor:
             if not isinstance(payload, dict):
                 return rule
 
-            rule.match = payload.get("match") if isinstance(payload.get("match"), str) else None
+            # match 可為單字串，也可為 ["關鍵詞1", "關鍵詞2"] 多關鍵詞
+            rule.match_keywords = self._normalize_keyword_list(payload.get("match"))
             rule.offset_range = self._normalize_offset_range(payload.get("offset"))
             rule.include_keywords = self._normalize_keyword_list(payload.get("include"))
             rule.exclude_keywords = self._normalize_keyword_list(payload.get("exclude"))
@@ -419,14 +420,14 @@ class YouTubeDataProcessor:
                 payload = json.loads(text)
             except json.JSONDecodeError:
                 # 舊資料若方括號格式壞掉，退回純字串 match，避免整列直接失效
-                return OffsetRule(match=text, raw=text)
+                return OffsetRule(match_keywords=[text], raw=text)
 
             normalized = self._normalize_offset_range(payload)
             if normalized:
                 rule.offset_range = normalized
                 return rule
 
-        rule.match = text
+        rule.match_keywords = [text]
         return rule
 
     def should_include_video(self, title, rule):
@@ -447,7 +448,8 @@ class YouTubeDataProcessor:
         if rule.include_keywords and not any(keyword in title for keyword in rule.include_keywords):
             return False
 
-        if rule.match and rule.match not in title:
+        # match 陣列採 AND：所有關鍵詞都必須命中
+        if rule.match_keywords and not all(keyword in title for keyword in rule.match_keywords):
             return False
 
         if rule.offset_range is not None:
