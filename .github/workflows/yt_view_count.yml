@@ -4,9 +4,14 @@ on:
   schedule:
     # 每天 UTC 13:00 (台灣時間 21:00) 執行
     - cron: '0 13 * * *'
-  
-  # 允許手動觸發 (方便測試)
+
+  # 允許外部 API 觸發
   workflow_dispatch:
+    inputs:
+      reason:
+        description: '觸發原因'
+        required: false
+        default: 'external trigger'
 
 jobs:
   build:
