@@ -390,10 +390,9 @@ class YouTubeDataProcessor:
                 self.repeated_requests_blocked += 1
                 print(
                     "[YouTube API][防護] 偵測到重複的播放清單分頁要求，"
-                    "已阻擋且不重試。"
+                    "停止分頁並保留先前已取得的影片。"
                 )
-                self.playlist_cache[playlist_id] = []
-                return []
+                break
 
             if not self._reserve_api_request("playlistItems.list", estimated_units=1):
                 return None
