@@ -3,9 +3,10 @@ import json
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -26,6 +27,38 @@ TZ_UTC_PLUS_8 = timezone(timedelta(hours=8))
 DEFAULT_FONT_COLOR = "#000000"
 ERROR_FONT_COLOR = "#ff0000"
 DEFAULT_REGION_BLOCK_SIZE = 6
+
+# YouTube Data API 安全限制。
+# 目前本程式使用的 playlistItems.list / videos.list 都是每次 1 quota unit。
+# 可在 GitHub Actions Secrets / Variables 覆寫；設得過大會失去防暴衝效果。
+DEFAULT_YOUTUBE_RUN_QUOTA_LIMIT = 10000
+DEFAULT_YOUTUBE_MAX_PLAYLIST_PAGES = 100
+
+
+def read_positive_int_env(name, default):
+    """讀取正整數環境變數；無效值採安全預設值。"""
+    try:
+        value = int(os.getenv(name, str(default)))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def sanitize_log_text(value):
+    """遮蔽已知憑證與資源 ID，避免公開 log 洩漏隱私。"""
+    text = str(value)
+    secrets = [
+        GAS_KEY,
+        YOUTUBE_API_KEY,
+        TG_BOT_TOKEN,
+        TG_CHAT_ID,
+        *SPREADSHEET_IDS,
+    ]
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "[已隱藏]")
+    text = re.sub(r"([?&]key=)[^&\s]+", r"\1[已隱藏]", text, flags=re.IGNORECASE)
+    return text
 
 
 # ==========================================
@@ -137,10 +170,11 @@ class AnimeAPI:
 
             result = response.json()
             if result.get("status") != "success":
-                raise Exception(f"API Error: {result.get('message')}")
+                raise Exception(f"API Error: {sanitize_log_text(result.get('message'))}")
             return result.get("data")
         except json.JSONDecodeError:
-            raise Exception(f"Invalid JSON response: {response.text[:100]}...")
+            # 回應內容可能包含試算表資料，不直接輸出到公開 log。
+            raise Exception("Invalid JSON response (內容已隱藏)")
 
     def get_schedule(self):
         return self._call("get_schedule")
@@ -162,6 +196,26 @@ class YouTubeDataProcessor:
     def __init__(self, api_key):
         self.api_key = api_key
         self.quota_exceeded = False
+        self.api_stopped = False
+        self.stop_reason = ""
+        self.run_quota_limit = read_positive_int_env(
+            "YOUTUBE_RUN_QUOTA_LIMIT", DEFAULT_YOUTUBE_RUN_QUOTA_LIMIT
+        )
+        self.max_playlist_pages = read_positive_int_env(
+            "YOUTUBE_MAX_PLAYLIST_PAGES", DEFAULT_YOUTUBE_MAX_PLAYLIST_PAGES
+        )
+        self.api_request_count = 0
+        self.estimated_quota_units = 0
+        self.api_method_counts = Counter()
+        self.api_method_units = Counter()
+        self.playlist_cache_hits = 0
+        self.video_cache_hits = 0
+        self.duplicate_playlist_refs_skipped = 0
+        self.duplicate_video_ids_skipped = 0
+        self.repeated_requests_blocked = 0
+        self.failed_video_ids_skipped = 0
+        self.playlists_blocked_by_page_limit = 0
+        self._usage_summary_printed = False
         # 忽略關鍵字清單
         self.ignore_keywords = [
             "預告",
@@ -198,14 +252,99 @@ class YouTubeDataProcessor:
         # 避免用 None 與「已存在但沒有 viewCount」的影片混在一起。
         self.unavailable_video_ids = set()
 
+        # 「已嘗試」和「成功快取」分開記錄：即使請求失敗，同次執行也不重送。
+        self.attempted_playlist_pages: Set[Tuple[str, str]] = set()
+        self.attempted_video_ids: Set[str] = set()
+
+    @property
+    def requests_stopped(self):
+        return self.quota_exceeded or self.api_stopped
+
+    def print_safety_config(self):
+        print(
+            f"[YouTube API] 單次執行估算配額上限: {self.run_quota_limit}；"
+            f"單一播放清單最多讀取 {self.max_playlist_pages} 頁"
+        )
+
+    def _stop_api(self, reason, quota_exceeded=False):
+        if quota_exceeded:
+            self.quota_exceeded = True
+        self.api_stopped = True
+        if not self.stop_reason:
+            self.stop_reason = reason
+
+    def _reserve_api_request(self, method, estimated_units=1, batch_size=None):
+        """在送出要求前登記用量，超過本次執行上限就直接阻擋。"""
+        if self.requests_stopped:
+            return False
+
+        if self.estimated_quota_units + estimated_units > self.run_quota_limit:
+            reason = (
+                f"已達單次執行安全上限 {self.run_quota_limit} 個估算 quota units"
+            )
+            self._stop_api(reason)
+            print(f"[YouTube API][安全停止] {reason}；不再送出任何要求。")
+            return False
+
+        self.api_request_count += 1
+        self.estimated_quota_units += estimated_units
+        self.api_method_counts[method] += 1
+        self.api_method_units[method] += estimated_units
+
+        batch_text = f"｜批次項目={batch_size}" if batch_size is not None else ""
+        print(
+            f"[YouTube API] 呼叫 #{self.api_request_count}: {method}"
+            f"｜本次估算={estimated_units}｜累計估算={self.estimated_quota_units}"
+            f"/{self.run_quota_limit}{batch_text}"
+        )
+        return True
+
+    def _log_api_result(self, method, status_code, returned_items=None):
+        item_text = f"｜回傳項目={returned_items}" if returned_items is not None else ""
+        print(f"[YouTube API] 結果: {method}｜HTTP={status_code}{item_text}")
+
+    def print_usage_summary(self):
+        """只輸出統計數字，不輸出 API key、影片 ID、播放清單 ID 或 URL。"""
+        if self._usage_summary_printed:
+            return
+        self._usage_summary_printed = True
+
+        print("\n====== YouTube API 用量摘要（本次執行估算） ======")
+        print(
+            f"實際送出要求: {self.api_request_count} 次；"
+            f"估算 quota units: {self.estimated_quota_units}/{self.run_quota_limit}"
+        )
+        if self.api_method_counts:
+            for method in sorted(self.api_method_counts):
+                print(
+                    f"  - {method}: {self.api_method_counts[method]} 次，"
+                    f"估算 {self.api_method_units[method]} units"
+                )
+        else:
+            print("  - 本次沒有送出 YouTube API 要求")
+        print(
+            "節省/阻擋統計: "
+            f"播放清單快取={self.playlist_cache_hits}、"
+            f"影片統計快取={self.video_cache_hits}、"
+            f"重複播放清單參照={self.duplicate_playlist_refs_skipped}、"
+            f"重複影片 ID={self.duplicate_video_ids_skipped}、"
+            f"已失敗影片不重送={self.failed_video_ids_skipped}、"
+            f"重複要求阻擋={self.repeated_requests_blocked}、"
+            f"超長播放清單阻擋={self.playlists_blocked_by_page_limit}"
+        )
+        if self.stop_reason:
+            print(f"停止原因: {sanitize_log_text(self.stop_reason)}")
+        print("註：這是依 API 方法計算的估算值；Google 不會在回應中提供剩餘日額度。")
+
     def _check_quota(self, response):
         if response.status_code == 403:
             try:
                 error_data = response.json()
                 reasons = [e.get("reason") for e in error_data.get("error", {}).get("errors", [])]
                 if "quotaExceeded" in reasons or "dailyLimitExceeded" in reasons:
-                    print("!!! YouTube API Quota Exceeded. Stopping all requests. !!!")
-                    self.quota_exceeded = True
+                    reason = "Google 回報 YouTube API 配額已滿"
+                    print(f"[YouTube API][配額停止] {reason}；不再送出任何要求。")
+                    self._stop_api(reason, quota_exceeded=True)
                     return True
             except Exception:
                 pass
@@ -225,41 +364,98 @@ class YouTubeDataProcessor:
 
     def get_playlist_items(self, playlist_id, playlist_sequence=0):
         """取得播放清單中的所有影片 ID、標題與在清單中的位置"""
-        if self.quota_exceeded:
+        if self.requests_stopped:
             return None
 
         cached = self.playlist_cache.get(playlist_id)
         if cached == "REMOVED":
+            self.playlist_cache_hits += 1
             return "REMOVED"
         if isinstance(cached, list):
+            self.playlist_cache_hits += 1
             # playlist_sequence 代表同一格有多個播放清單時的原始順序
             return [{**item, "playlist_sequence": playlist_sequence} for item in cached]
 
         items = []
         next_page_token = ""
+        fetched_pages = 0
 
         while True:
-            url = (
-                f"{self.youtube_base_url}/playlistItems?part=snippet&maxResults=50"
-                f"&playlistId={playlist_id}&key={self.api_key}&hl=zh-Hant"
-            )
-            if next_page_token:
-                url += f"&pageToken={next_page_token}"
+            if fetched_pages >= self.max_playlist_pages:
+                self.playlists_blocked_by_page_limit += 1
+                print(
+                    "[YouTube API][防護] 播放清單超過允許頁數，"
+                    "已放棄這份清單，避免單一清單耗盡配額。"
+                )
+                # 不使用不完整清單，並快取失敗結果，避免同次執行再查。
+                self.playlist_cache[playlist_id] = []
+                return []
 
-            res = requests.get(url)
+            page_key = (playlist_id, next_page_token)
+            if page_key in self.attempted_playlist_pages:
+                self.repeated_requests_blocked += 1
+                print(
+                    "[YouTube API][防護] 偵測到重複的播放清單分頁要求，"
+                    "停止分頁並保留先前已取得的影片。"
+                )
+                break
+
+            if not self._reserve_api_request("playlistItems.list", estimated_units=1):
+                return None
+            self.attempted_playlist_pages.add(page_key)
+
+            params = {
+                "part": "snippet",
+                "maxResults": 50,
+                "playlistId": playlist_id,
+                "key": self.api_key,
+                "hl": "zh-Hant",
+            }
+            if next_page_token:
+                params["pageToken"] = next_page_token
+
+            try:
+                res = requests.get(
+                    f"{self.youtube_base_url}/playlistItems",
+                    params=params,
+                    timeout=30,
+                )
+            except requests.RequestException:
+                print(
+                    "[YouTube API] playlistItems.list 發生網路錯誤；"
+                    "本次執行不重試這個分頁。"
+                )
+                self.playlist_cache[playlist_id] = []
+                return []
+
+            fetched_pages += 1
             if self._check_quota(res):
+                self._log_api_result("playlistItems.list", res.status_code)
                 return None
             if res.status_code == 404:
+                self._log_api_result("playlistItems.list", res.status_code)
                 # 404 視為播放清單已移除，快取結果避免重複打 API
                 self.playlist_cache[playlist_id] = "REMOVED"
                 return "REMOVED"
             if res.status_code != 200:
-                print(f"Error fetching playlist {playlist_id}: {res.status_code}")
+                self._log_api_result("playlistItems.list", res.status_code)
+                print("[YouTube API] 播放清單讀取失敗；本次執行不重試。")
                 self.playlist_cache[playlist_id] = []
                 return []
 
-            data = res.json()
-            for item in data.get("items", []):
+            try:
+                data = res.json()
+            except ValueError:
+                self._log_api_result("playlistItems.list", res.status_code)
+                print("[YouTube API] 播放清單回應不是有效 JSON；本次執行不重試。")
+                self.playlist_cache[playlist_id] = []
+                return []
+
+            response_items = data.get("items", [])
+            self._log_api_result(
+                "playlistItems.list", res.status_code, returned_items=len(response_items)
+            )
+            for item in response_items:
                 snippet = item.get("snippet", {})
                 vid = snippet.get("resourceId", {}).get("videoId")
                 if vid:
@@ -281,17 +477,25 @@ class YouTubeDataProcessor:
 
     def get_video_stats(self, video_ids):
         """批量取得影片統計資料 (ViewCount)，並過濾尚未首播的影片"""
-        if self.quota_exceeded or not video_ids:
+        if self.requests_stopped or not video_ids:
             return {}
 
         stats_map = {}
         pending_ids = []
+        unique_video_ids = list(dict.fromkeys(video_ids))
+        duplicate_count = len(video_ids) - len(unique_video_ids)
+        if duplicate_count:
+            self.duplicate_video_ids_skipped += duplicate_count
 
-        for vid in video_ids:
+        for vid in unique_video_ids:
             if vid in self.unavailable_video_ids:
                 continue
             if vid in self.video_stats_cache:
                 stats_map[vid] = self.video_stats_cache[vid]
+                self.video_cache_hits += 1
+            elif vid in self.attempted_video_ids:
+                # 先前批次曾失敗或回應無法解析；依需求，本次執行不重送。
+                self.failed_video_ids_skipped += 1
             else:
                 pending_ids.append(vid)
 
@@ -299,20 +503,52 @@ class YouTubeDataProcessor:
         # 每次最多 50 筆
         for i in range(0, len(pending_ids), 50):
             batch = pending_ids[i : i + 50]
-            ids_str = ",".join(batch)
-            url = (
-                f"{self.youtube_base_url}/videos?part=statistics,liveStreamingDetails"
-                f"&id={ids_str}&key={self.api_key}&hl=zh-Hant"
-            )
-            res = requests.get(url)
-            if self._check_quota(res):
+            if not self._reserve_api_request(
+                "videos.list", estimated_units=1, batch_size=len(batch)
+            ):
                 return stats_map
-            if res.status_code != 200:
-                print(f"Error fetching video stats: {res.status_code}")
+
+            # 在送出前標記；即使逾時、5xx 或 JSON 錯誤，同次執行也不再查這批 ID。
+            self.attempted_video_ids.update(batch)
+            params = {
+                "part": "statistics,liveStreamingDetails",
+                "id": ",".join(batch),
+                "key": self.api_key,
+                "hl": "zh-Hant",
+            }
+            try:
+                res = requests.get(
+                    f"{self.youtube_base_url}/videos",
+                    params=params,
+                    timeout=30,
+                )
+            except requests.RequestException:
+                print(
+                    "[YouTube API] videos.list 發生網路錯誤；"
+                    "本次執行不重試這批影片。"
+                )
                 continue
 
+            if self._check_quota(res):
+                self._log_api_result("videos.list", res.status_code)
+                return stats_map
+            if res.status_code != 200:
+                self._log_api_result("videos.list", res.status_code)
+                print("[YouTube API] 影片統計讀取失敗；本次執行不重試這批影片。")
+                continue
+
+            try:
+                response_items = res.json().get("items", [])
+            except ValueError:
+                self._log_api_result("videos.list", res.status_code)
+                print("[YouTube API] 影片統計回應不是有效 JSON；本次執行不重試這批影片。")
+                continue
+
+            self._log_api_result(
+                "videos.list", res.status_code, returned_items=len(response_items)
+            )
             seen_ids = set()
-            for item in res.json().get("items", []):
+            for item in response_items:
                 vid = item.get("id")
                 seen_ids.add(vid)
 
@@ -338,7 +574,7 @@ class YouTubeDataProcessor:
                 if missing_vid not in seen_ids:
                     self.unavailable_video_ids.add(missing_vid)
 
-        for vid in video_ids:
+        for vid in unique_video_ids:
             if (
                 vid not in self.unavailable_video_ids
                 and vid not in stats_map
@@ -486,7 +722,7 @@ class YouTubeDataProcessor:
 
     def process_region(self, region_data, rule):
         """處理單一作品在單一國家區塊內的觀看量計算"""
-        if self.quota_exceeded:
+        if self.requests_stopped:
             return None
 
         result = RegionStats()
@@ -495,11 +731,17 @@ class YouTubeDataProcessor:
 
         all_items = []
         has_valid_playlist = False
+        seen_playlist_ids = set()
 
         for playlist_sequence, url in enumerate(region_data.link_urls):
             playlist_id = self.get_playlist_id(url)
             if not playlist_id:
                 continue
+
+            if playlist_id in seen_playlist_ids:
+                self.duplicate_playlist_refs_skipped += 1
+                continue
+            seen_playlist_ids.add(playlist_id)
 
             has_valid_playlist = True
             # 取得播放清單，並保留同一儲存格內多個清單的先後順序
@@ -508,6 +750,9 @@ class YouTubeDataProcessor:
                 continue
             if items:
                 all_items.extend(items)
+
+        if self.requests_stopped:
+            return None
 
         if not has_valid_playlist:
             return None
@@ -527,18 +772,19 @@ class YouTubeDataProcessor:
         seen_ids = set()
         for video in valid_videos:
             if video["id"] in seen_ids:
+                self.duplicate_video_ids_skipped += 1
                 continue
             seen_ids.add(video["id"])
             deduped_videos.append(video)
         valid_videos = deduped_videos
 
         stats = self.get_video_stats([video["id"] for video in valid_videos])
+        if self.requests_stopped:
+            return None
         # 過濾不存在 / private / deleted 影片
         valid_videos = [video for video in valid_videos if video["id"] in stats]
         if not valid_videos:
             return result
-        if self.quota_exceeded:
-            return None
 
         playlist_orders = self._detect_playlist_orders(valid_videos, rule.playlist_order)
         playlist_max_positions = {}
@@ -906,7 +1152,7 @@ def calculate_sheet_updates(sheet_model, processor):
 
         # --- 第一階段：讀取該區域所有影片數據 ---
         for row in sheet_model.rows:
-            if processor.quota_exceeded:
+            if processor.requests_stopped:
                 return []
 
             region_data = row.regions[region.name]
@@ -969,7 +1215,7 @@ def calculate_sheet_updates(sheet_model, processor):
             queue_value_update(row_payload, region_data.total_view_cell, stats.total)
             queue_value_update(row_payload, region_data.first_view_cell, stats.first)
 
-    if not processor.quota_exceeded:
+    if not processor.requests_stopped:
         # --- 第四階段：計算並寫入「綜合排名」 ---
         print(f"\n[{sheet_model.sheet_name}] 正在計算綜合排名...")
 
@@ -1004,12 +1250,15 @@ def send_telegram_error(error_msg):
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
         payload = {
             "chat_id": TG_CHAT_ID,
-            "text": f"[日本動畫 Youtube亞洲新番觀看量]\n發生錯誤:\n\n{error_msg}",
+            "text": (
+                "[日本動畫 Youtube亞洲新番觀看量]\n發生錯誤:\n\n"
+                f"{sanitize_log_text(error_msg)}"
+            ),
         }
         requests.post(url, json=payload)
         print("已發送錯誤通知至 Telegram")
     except Exception as e:
-        print(f"發送 Telegram 失敗: {e}")
+        print(f"發送 Telegram 失敗: {sanitize_log_text(e)}")
 
 
 def process_single_sheet(sheet_name, gas_api=None, processor=None):
@@ -1023,7 +1272,7 @@ def process_single_sheet(sheet_name, gas_api=None, processor=None):
     try:
         snapshot = gas_api.get_sheet_snapshot(sheet_name)
     except Exception as e:
-        print(f"讀取工作表 {sheet_name} 失敗: {e}")
+        print(f"讀取工作表 {sheet_name} 失敗: {sanitize_log_text(e)}")
         return
 
     sheet_model = parse_sheet_snapshot(sheet_name, snapshot)
@@ -1034,8 +1283,8 @@ def process_single_sheet(sheet_name, gas_api=None, processor=None):
     # 由 Python 端完成所有區塊解析與觀看量計算
     updates_batch = calculate_sheet_updates(sheet_model, processor)
 
-    if processor.quota_exceeded:
-        print("\n[暫停] 因為配額已滿，不執行寫入")
+    if processor.requests_stopped:
+        print(f"\n[暫停] {processor.stop_reason}，不執行寫入")
         return
 
     if not updates_batch:
@@ -1051,25 +1300,22 @@ def process_single_sheet(sheet_name, gas_api=None, processor=None):
             f"衝突: {len(resp.get('conflicts', []))}, 錯誤: {len(resp.get('errors', []))}"
         )
         if resp.get("conflicts"):
-            print("[寫入] 衝突列如下:")
-            for conflict in resp["conflicts"][:10]:
-                print(f"  - {conflict}")
+            print("[寫入] 衝突明細已隱藏，避免公開 log 洩漏試算表內容。")
         if resp.get("errors"):
-            print("[寫入] 錯誤如下:")
-            for error in resp["errors"][:10]:
-                print(f"  - {error}")
+            print("[寫入] 錯誤明細已隱藏，避免公開 log 洩漏試算表內容。")
 
         if resp.get("updated", 0) > 0:
             # 只有真的有成功寫入時才排序
             print(f"[排序] 正在對 {sheet_name} 進行綜合排名排序...")
             sort_resp = gas_api.sort_data(sheet_name)
-            print(f"[排序] {sort_resp.get('message')}")
+            print(f"[排序] {sanitize_log_text(sort_resp.get('message'))}")
     except Exception as e:
-        print(f"[寫入/排序] 失敗: {e}")
+        print(f"[寫入/排序] 失敗: {sanitize_log_text(e)}")
 
 
 def main():
     print("=== 開始執行自動化更新任務 ===")
+    yt_processor.print_safety_config()
     # 用於捕捉是否有任何錯誤發生
     global_error_occurred = False
 
@@ -1085,7 +1331,7 @@ def main():
             if not ss_id:
                 continue
 
-            print(f"\n>>>>>>>> 正在處理第 {idx + 1} 個試算表 (ID: {ss_id}) <<<<<<<<")
+            print(f"\n>>>>>>>> 正在處理第 {idx + 1} 個試算表 (ID 已隱藏) <<<<<<<<")
 
             gas_api = AnimeAPI(GAS_URL, ss_id)
             global current_gas_api
@@ -1096,7 +1342,7 @@ def main():
             try:
                 schedule = gas_api.get_schedule()
             except Exception as e:
-                print(f"讀取排程失敗: {e}")
+                print(f"讀取排程失敗: {sanitize_log_text(e)}")
                 raise
 
             # 2. 決定要更新哪些工作表
@@ -1115,11 +1361,15 @@ def main():
 
             # 3. 逐一處理每個工作表
             for sheet_name in target_sheets:
-                if yt_processor.quota_exceeded:
-                    print("因配額已滿，停止後續工作表的處理。")
-                    raise Exception("YouTube API 配額已滿")
+                if yt_processor.requests_stopped:
+                    print("YouTube API 已停止，停止後續工作表的處理。")
+                    raise Exception(yt_processor.stop_reason or "YouTube API 已停止")
 
                 process_single_sheet(sheet_name)
+
+                if yt_processor.requests_stopped:
+                    print("YouTube API 已停止，停止後續工作表的處理。")
+                    raise Exception(yt_processor.stop_reason or "YouTube API 已停止")
 
                 if sheet_name != target_sheets[-1]:
                     time.sleep(2)
@@ -1132,7 +1382,7 @@ def main():
         import traceback
 
         error_class = e.__class__.__name__
-        detail = e.args[0] if e.args else str(e)
+        detail = sanitize_log_text(e.args[0] if e.args else str(e))
         # 取得詳細錯誤訊息
         _, _, tb = sys.exc_info()
         last_call_stack = traceback.extract_tb(tb)[-1]
@@ -1143,32 +1393,42 @@ def main():
         print(f"\n❌ 發生嚴重錯誤: {err_msg}")
         send_telegram_error(err_msg)
 
-    if not global_error_occurred:
-        print("\n✅ 所有任務執行完成，且無錯誤。")
+    if global_error_occurred:
+        yt_processor.print_usage_summary()
+        return
+
+    print("\n✅ 所有任務執行完成，且無錯誤。")
+    try:
+        # 更新所有表格的系統時間
+        now_str = datetime.datetime.now(TZ_UTC_PLUS_8).strftime("%Y年%m月%d日 %H:%M")
+        print(f"正在更新系統時間標記: {now_str}")
+
+        for idx, ss_id in enumerate(SPREADSHEET_IDS):
+            if not ss_id:
+                continue
+            api = AnimeAPI(GAS_URL, ss_id)
+            res = api.update_system_time(now_str)
+            print(
+                f"  - 第 {idx + 1} 個試算表: "
+                f"{sanitize_log_text(res.get('message'))}"
+            )
+    except Exception as e:
+        safe_error = sanitize_log_text(e)
+        print(f"更新系統時間時發生錯誤: {safe_error}")
+        send_telegram_error(f"更新系統時間失敗: {safe_error}")
+        yt_processor.print_usage_summary()
+        return
+
+    if HEARTBEAT_URL:
         try:
-            # 更新所有表格的系統時間
-            now_str = datetime.datetime.now(TZ_UTC_PLUS_8).strftime("%Y年%m月%d日 %H:%M")
-            print(f"正在更新系統時間標記: {now_str}")
-
-            for ss_id in SPREADSHEET_IDS:
-                if not ss_id:
-                    continue
-                api = AnimeAPI(GAS_URL, ss_id)
-                res = api.update_system_time(now_str)
-                print(f"  - 試算表 {ss_id[-4:]}... : {res.get('message')}")
+            # 發送 Heartbeat
+            print("正在發送 Heartbeat...")
+            requests.get(HEARTBEAT_URL, timeout=30)
+            print("Heartbeat 發送成功")
         except Exception as e:
-            print(f"更新系統時間時發生錯誤: {e}")
-            send_telegram_error(f"更新系統時間失敗: {e}")
-            return
+            print(f"Heartbeat 發送失敗: {sanitize_log_text(e)}")
 
-        if HEARTBEAT_URL:
-            try:
-                # 發送 Heartbeat
-                print("正在發送 Heartbeat...")
-                requests.get(HEARTBEAT_URL)
-                print("Heartbeat 發送成功")
-            except Exception as e:
-                print(f"Heartbeat 發送失敗: {e}")
+    yt_processor.print_usage_summary()
 
 
 if __name__ == "__main__":
