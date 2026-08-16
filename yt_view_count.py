@@ -187,10 +187,16 @@ class YouTubeDataProcessor:
         ]
         # 有例外動畫名稱的關鍵字
         self.ignore_keywords_exceptions = {"CM": ["testCM動畫名稱"]}
+        # 短英文縮寫必須以獨立 token 出現，避免把 UNRIVALED 的 ED
+        # 或其他一般單字中的字母誤判成 OP / ED / PV 等影片類型。
+        self.ignore_token_keywords = {"PV", "NCED", "NCOP", "OP", "ED", "CM"}
         self.youtube_base_url = "https://www.googleapis.com/youtube/v3"
         # 同一次執行中，播放清單與影片統計都盡量重用快取，節省 API 配額
         self.playlist_cache: Dict[str, object] = {}
         self.video_stats_cache: Dict[str, Optional[int]] = {}
+        # videos.list 查不到或尚未首播的影片不能算進集數；另外記錄，
+        # 避免用 None 與「已存在但沒有 viewCount」的影片混在一起。
+        self.unavailable_video_ids = set()
 
     def _check_quota(self, response):
         if response.status_code == 403:
@@ -282,6 +288,8 @@ class YouTubeDataProcessor:
         pending_ids = []
 
         for vid in video_ids:
+            if vid in self.unavailable_video_ids:
+                continue
             if vid in self.video_stats_cache:
                 stats_map[vid] = self.video_stats_cache[vid]
             else:
@@ -316,8 +324,7 @@ class YouTubeDataProcessor:
                             live_details["scheduledStartTime"].replace("Z", "+00:00")
                         )
                         if dt_start > now_utc:
-                            self.video_stats_cache[vid] = None
-                            stats_map[vid] = None
+                            self.unavailable_video_ids.add(vid)
                             continue
                     except ValueError:
                         pass
@@ -329,10 +336,14 @@ class YouTubeDataProcessor:
 
             for missing_vid in batch:
                 if missing_vid not in seen_ids:
-                    self.video_stats_cache[missing_vid] = None
+                    self.unavailable_video_ids.add(missing_vid)
 
         for vid in video_ids:
-            if vid not in stats_map and vid in self.video_stats_cache:
+            if (
+                vid not in self.unavailable_video_ids
+                and vid not in stats_map
+                and vid in self.video_stats_cache
+            ):
                 stats_map[vid] = self.video_stats_cache[vid]
         return stats_map
 
@@ -381,7 +392,14 @@ class YouTubeDataProcessor:
             if kw in self.ignore_keywords_exceptions:
                 if any(exc in title for exc in self.ignore_keywords_exceptions[kw]):
                     continue
-            if kw in title:
+            if kw in self.ignore_token_keywords:
+                matched = re.search(
+                    rf"(?<![A-Za-z]){re.escape(kw)}(?![A-Za-z])",
+                    title,
+                )
+            else:
+                matched = kw in title
+            if matched:
                 return True
         return False
 
