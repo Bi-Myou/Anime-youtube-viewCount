@@ -149,6 +149,32 @@ class YtViewCountTests(unittest.TestCase):
             with self.subTest(title=title):
                 self.assertEqual(processor.parse_episode_number(title), expected)
 
+    def test_mission_episode_titles_respect_offset_and_exclude_promos(self):
+        items = [
+            {"id": f"ep{ep}", "title": f"夜櫻家大作戰 第二季 作戰{ep}【正片】 | Muse木棉花 動畫 線上看",
+             "position": pos}
+            for pos, ep in enumerate([39, 41, 42, 51, 52, 40])
+        ]
+        items.extend([
+            {"id": "preview", "title": "【夜櫻家大作戰 第二季】第40話預告《家庭餐廳父女對話》",
+             "position": 6},
+            {"id": "pv", "title": "【夜櫻家大作戰 第二季 後半】金級特務PV(2026 十月新番)",
+             "position": 7},
+        ])
+        processor = StubYouTubeDataProcessor(
+            {"PL": items},
+            {**{f"ep{ep}": ep * 10 for ep in [39, 40, 41, 42, 51, 52]},
+             "preview": 9999, "pv": 9999},
+        )
+        self.assertEqual(processor.parse_episode_number("夜櫻家大作戰 第二季 作戰40【家庭餐廳父女對話】"), 40)
+        self.assertEqual(processor.parse_episode_number("夜樱家大作战 第二季 作战４１"), 41)
+        self.assertIsNone(processor.parse_episode_number("夜櫻家大作戰 第二季"))
+        result = processor.process_region(
+            self.make_region_data(["https://www.youtube.com/playlist?list=PL"]),
+            processor.parse_offset_rule("[40,51]"),
+        )
+        self.assertEqual(result, mod.RegionStats(avg=435, total=1740, first=400, valid_count=4))
+
     def test_mixed_anione_titles_select_first_episode_anywhere(self):
         title = "The Forsaken Saintess and Her Foodie Road Trip in Another World"
         for order in [(12, 10, 2, 1), (12, 1, 2, 10)]:
