@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import timedelta, timezone
@@ -73,6 +74,8 @@ class OffsetRule:
     playlist_order: str = "auto"
     invalid_json: bool = False
     raw: str = ""
+    first_match_keywords: List[str] = field(default_factory=list)
+    first_video_id: Optional[str] = None
 
 
 @dataclass
@@ -351,14 +354,42 @@ class YouTubeDataProcessor:
         return False
 
     def get_playlist_id(self, url):
-        """從連結中提取 Playlist ID"""
+        """從 playlist 或 show 連結中提取 Playlist ID。"""
         if not url:
             return None
         try:
-            query = parse_qs(urlparse(url).query)
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query)
             if "list" in query:
                 return query["list"][0]
+            if (parsed.hostname or "").lower() in {"youtube.com", "www.youtube.com", "m.youtube.com"}:
+                match = re.fullmatch(r"/show/VL([A-Za-z0-9_-]+)/?", parsed.path)
+                if match:
+                    return match.group(1)
         except Exception:
+            pass
+        return None
+
+    def get_video_id(self, url):
+        """解析影片連結；watch 連結即使帶有 list 參數，仍視為單支影片。"""
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            parts = parsed.path.strip("/").split("/")
+            video_id = None
+            if host in {"youtu.be", "www.youtu.be"}:
+                video_id = parts[0]
+            elif host in {
+                "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+                "youtube-nocookie.com", "www.youtube-nocookie.com",
+            }:
+                if parsed.path.rstrip("/") == "/watch":
+                    video_id = parse_qs(parsed.query).get("v", [None])[0]
+                elif len(parts) == 2 and parts[0] in {"shorts", "live", "embed"}:
+                    video_id = parts[1]
+            if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                return video_id
+        except (TypeError, ValueError):
             pass
         return None
 
@@ -589,6 +620,7 @@ class YouTubeDataProcessor:
         回傳: int 或 float (不減 1，直接回傳原始數值)
         """
 
+        title = unicodedata.normalize("NFKC", title)
         patterns = [
             # 1. 中文規則 (例如: 第1集, 第 12 話, 第1.5話)
             r"第\s*(\d+(?:\.\d+)?)\s*[集話]",
@@ -604,10 +636,14 @@ class YouTubeDataProcessor:
             r"Episod\s*[\.]?\s*(\d+(?:\.\d+)?)",
             # 0. 簡寫規則 (例如: EP.5, EP 05)
             r"EP\s*[\.]?\s*(\d+(?:\.\d+)?)",
-            # 0. 方括號規則 (例如: [12], [05]) - 視情況開啟，可能會誤判年份
-            # r'\[(\d+(?:\.\d+)?)\]',
+            # Ani-One 等頻道會混用 |E1(ENSub/JPDub) 與 Ep. #12。
+            r"(?<![A-Za-z0-9])E\s*[\.]?\s*(\d+(?:\.\d+)?)",
             # 0. 純井號規則 (例如: #12)
             r'#\s*(\d+(?:\.\d+)?)',
+            # 純集數括號：限制最多三位數，避免把 [2026] 年份當成集數。
+            r"[\[【]\s*(\d{1,3}(?:\.\d+)?)\s*[\]】]",
+            # 常見標題：作品名稱 - 01、作品名稱｜01｜副標題。
+            r"(?:\s[-–—]\s*|[|｜])\s*(\d{1,3}(?:\.\d+)?)(?=\s|$|[\[【|｜])",
         ]
 
         for pattern in patterns:
@@ -671,6 +707,10 @@ class YouTubeDataProcessor:
             rule.exclude_keywords = self._normalize_keyword_list(payload.get("exclude"))
             playlist_order = str(payload.get("playlist_order", "auto")).lower()
             rule.playlist_order = playlist_order if playlist_order in {"auto", "asc", "desc"} else "auto"
+            rule.first_match_keywords = self._normalize_keyword_list(payload.get("first_match"))
+            first_video_id = payload.get("first_video_id")
+            if isinstance(first_video_id, str) and first_video_id.strip():
+                rule.first_video_id = first_video_id.strip()
             return rule
 
         if text.startswith("[") and text.endswith("]"):
@@ -730,10 +770,24 @@ class YouTubeDataProcessor:
             return None
 
         all_items = []
-        has_valid_playlist = False
+        has_valid_link = False
         seen_playlist_ids = set()
 
         for playlist_sequence, url in enumerate(region_data.link_urls):
+            video_id = self.get_video_id(url)
+            if video_id:
+                has_valid_link = True
+                # 明確指定的單支影片不套用播放清單的標題/集數過濾。
+                all_items.append({
+                    "id": video_id,
+                    "title": "",
+                    "playlist_id": "",
+                    "playlist_sequence": playlist_sequence,
+                    "position": 0,
+                    "direct_video": True,
+                })
+                continue
+
             playlist_id = self.get_playlist_id(url)
             if not playlist_id:
                 continue
@@ -743,7 +797,7 @@ class YouTubeDataProcessor:
                 continue
             seen_playlist_ids.add(playlist_id)
 
-            has_valid_playlist = True
+            has_valid_link = True
             # 取得播放清單，並保留同一儲存格內多個清單的先後順序
             items = self.get_playlist_items(playlist_id, playlist_sequence)
             if items == "REMOVED":
@@ -754,14 +808,14 @@ class YouTubeDataProcessor:
         if self.requests_stopped:
             return None
 
-        if not has_valid_playlist:
+        if not has_valid_link:
             return None
         if not all_items:
             return result
 
         valid_videos = []
         for item in all_items:
-            if self.should_include_video(item["title"], rule):
+            if item.get("direct_video") or self.should_include_video(item["title"], rule):
                 valid_videos.append(item)
 
         if not valid_videos:
@@ -769,12 +823,16 @@ class YouTubeDataProcessor:
 
         # 去重複影片（依 video id）
         deduped_videos = []
-        seen_ids = set()
+        seen_ids = {}
         for video in valid_videos:
             if video["id"] in seen_ids:
                 self.duplicate_video_ids_skipped += 1
+                index = seen_ids[video["id"]]
+                if deduped_videos[index].get("direct_video") and not video.get("direct_video"):
+                    # 同時有直接連結與清單時，保留清單標題以便判斷首集。
+                    deduped_videos[index] = video
                 continue
-            seen_ids.add(video["id"])
+            seen_ids[video["id"]] = len(deduped_videos)
             deduped_videos.append(video)
         valid_videos = deduped_videos
 
@@ -795,8 +853,13 @@ class YouTubeDataProcessor:
                 int(video.get("position", 0)),
             )
 
-        # 首集判定優先看最小集數，完全無法解析時才回退到播放清單順序
-        first_video = self._select_first_video(valid_videos, playlist_orders, playlist_max_positions)
+        # 人工指定優先於自動辨識；單支影片的首集就是該影片。
+        if len(valid_videos) == 1 and valid_videos[0].get("direct_video"):
+            first_video = valid_videos[0]
+        else:
+            first_video = self._select_first_video(
+                valid_videos, playlist_orders, playlist_max_positions, rule
+            )
 
         # 計算總量與平均
         total_views = 0
@@ -869,10 +932,27 @@ class YouTubeDataProcessor:
                 resolved[playlist_id] = "asc"
         return resolved
 
-    def _select_first_video(self, videos, playlist_orders, playlist_max_positions):
+    def _select_first_video(self, videos, playlist_orders, playlist_max_positions, rule=None):
         """挑出首集對應的影片，用於填寫首集觀看"""
         if not videos:
             return None
+
+        if rule and (rule.first_video_id or rule.first_match_keywords):
+            if rule.first_video_id:
+                candidates = [video for video in videos if video["id"] == rule.first_video_id]
+            else:
+                candidates = [
+                    video for video in videos
+                    if all(keyword in video["title"] for keyword in rule.first_match_keywords)
+                ]
+            if len(candidates) != 1:
+                # 不靜默改選別集；關鍵詞命中多集時也需要使用者縮小範圍。
+                print(
+                    f"[首集指定] 符合條件的有效影片有 {len(candidates)} 支，"
+                    "首集觀看填入 ---；請檢查 OFFSET 的首集設定。"
+                )
+                return None
+            return candidates[0]
 
         def normalized_position(video):
             playlist_id = video["playlist_id"]

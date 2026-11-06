@@ -1,6 +1,5 @@
-import csv
 import unittest
-from pathlib import Path
+import json
 from unittest.mock import Mock, patch
 
 import yt_view_count as mod
@@ -30,6 +29,201 @@ class StubYouTubeDataProcessor(mod.YouTubeDataProcessor):
 
 
 class YtViewCountTests(unittest.TestCase):
+    def make_region_data(self, urls):
+        return mod.RegionRowData(
+            definition=mod.RegionDefinition("臺灣｜TW", 5, 5, 6, 7, 8, 9, [10]),
+            row_num=3,
+            anime_name="作品A",
+            link_urls=urls,
+            offset_raw=None,
+            offset_col=10,
+        )
+
+    def test_show_links_resolve_to_playlist_id(self):
+        processor = mod.YouTubeDataProcessor("test-key")
+        for url in [
+            "https://www.youtube.com/show/VLPLcKfVhnYS2Nk?sbp=KgtNZGlhZ2x1VVhQUUAB",
+            "https://www.youtube.com/show/VLPLcKfVhnYS2Nk",
+            "https://m.youtube.com/show/VLPLcKfVhnYS2Nk/",
+            "https://www.youtube.com/playlist?list=PLcKfVhnYS2Nk",
+        ]:
+            with self.subTest(url=url):
+                self.assertEqual(processor.get_playlist_id(url), "PLcKfVhnYS2Nk")
+        for url in [
+            "https://www.youtube.com/show/VL",
+            "https://www.youtube.com/show/PLcKfVhnYS2Nk",
+            "https://example.com/show/VLPLcKfVhnYS2Nk",
+        ]:
+            with self.subTest(url=url):
+                self.assertIsNone(processor.get_playlist_id(url))
+
+    def test_show_link_counts_playlist_and_deduplicates_equivalent_link(self):
+        processor = StubYouTubeDataProcessor(
+            {"PLcKfVhnYS2Nk": [
+                {"id": "ep2", "title": "Episode 2", "position": 0},
+                {"id": "ep1", "title": "Episode 1", "position": 1},
+            ]},
+            {"ep1": 100, "ep2": 200},
+        )
+        region_data = self.make_region_data([
+            "https://www.youtube.com/show/VLPLcKfVhnYS2Nk?sbp=KgtNZGlhZ2x1VVhQUUAB",
+            "https://www.youtube.com/playlist?list=PLcKfVhnYS2Nk",
+        ])
+        with patch.object(processor, "get_playlist_items", wraps=processor.get_playlist_items) as fetch:
+            result = processor.process_region(region_data, processor.parse_offset_rule(""))
+            fetch.assert_called_once_with("PLcKfVhnYS2Nk", 0)
+        self.assertEqual(result, mod.RegionStats(avg=150, total=300, first=100, valid_count=2))
+        self.assertEqual(processor.duplicate_playlist_refs_skipped, 1)
+
+    @patch("yt_view_count.requests.get")
+    def test_direct_video_urls_have_one_episode_and_identical_view_counts(self, mock_get):
+        video_id = "Abc_123-xYz"
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "items": [{"id": video_id, "statistics": {"viewCount": "123"}}]
+        }
+        mock_get.return_value = response
+        urls = [
+            f"https://www.youtube.com/watch?v={video_id}",
+            f"https://www.youtube.com/watch?v={video_id}&list=IGNORED&index=2",
+            f"https://youtu.be/{video_id}?si=share",
+            f"https://www.youtube.com/shorts/{video_id}",
+            f"https://www.youtube.com/live/{video_id}",
+            f"https://www.youtube.com/embed/{video_id}",
+            f"https://m.youtube.com/watch?v={video_id}",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                mock_get.reset_mock()
+                processor = mod.YouTubeDataProcessor("test-key")
+                result = processor.process_region(
+                    self.make_region_data([url]),
+                    processor.parse_offset_rule('{"match":"日語","offset":[2,12]}'),
+                )
+                self.assertEqual(result, mod.RegionStats(avg=123, total=123, first=123, valid_count=1))
+                mock_get.assert_called_once()
+                self.assertTrue(mock_get.call_args.args[0].endswith("/videos"))
+                self.assertEqual(mock_get.call_args.kwargs["params"]["id"], video_id)
+
+    def test_direct_video_missing_or_unavailable_views(self):
+        video_id = "Abc_123-xYz"
+        for stats, count in [({}, 0), ({video_id: None}, 1), ({video_id: 0}, 1)]:
+            with self.subTest(stats=stats):
+                processor = StubYouTubeDataProcessor(stats_map=stats)
+                result = processor.process_region(
+                    self.make_region_data([f"https://youtu.be/{video_id}"]),
+                    processor.parse_offset_rule(""),
+                )
+                self.assertEqual(result.valid_count, count)
+                expected = 0 if stats.get(video_id) == 0 else "---"
+                self.assertEqual((result.avg, result.total, result.first), (expected,) * 3)
+
+    def test_direct_video_duplicates_and_playlist_overlap_count_once(self):
+        video_id = "Abc_123-xYz"
+        processor = StubYouTubeDataProcessor(
+            {"PL": [{"id": video_id, "title": "Episode 1", "position": 0},
+                    {"id": "ep2", "title": "Episode 2", "position": 1}]},
+            {video_id: 100, "ep2": 200},
+        )
+        result = processor.process_region(
+            self.make_region_data([
+                f"https://youtu.be/{video_id}", f"https://www.youtube.com/watch?v={video_id}",
+                "https://www.youtube.com/playlist?list=PL",
+            ]),
+            processor.parse_offset_rule(""),
+        )
+        self.assertEqual(result.valid_count, 2)
+        self.assertEqual(result.total, 300)
+        self.assertEqual(result.first, 100)
+
+    def test_episode_number_formats_and_unrelated_numbers(self):
+        processor = mod.YouTubeDataProcessor("test-key")
+        for title, expected in [
+            ("The Forsaken Saintess and Her Foodie Road Trip in Another World|E1(ENSub/JPDub)", 1),
+            ("The Forsaken Saintess and Her Foodie Road Trip in Another World Ep. #12 (ENSub/JPDub)", 12),
+            ("作品【01】副標題", 1), ("作品 [01]", 1), ("作品 - 01", 1),
+            ("作品｜０１｜副標題", 1), ("作品 第1.5話", 1.5),
+            ("作品 [2026]", None), ("作品 Season 2", None),
+            ("TITLE1", None), ("作品 - 2026", None),
+        ]:
+            with self.subTest(title=title):
+                self.assertEqual(processor.parse_episode_number(title), expected)
+
+    def test_mixed_anione_titles_select_first_episode_anywhere(self):
+        title = "The Forsaken Saintess and Her Foodie Road Trip in Another World"
+        for order in [(12, 10, 2, 1), (12, 1, 2, 10)]:
+            with self.subTest(order=order):
+                items = [
+                    {"id": f"ep{ep}", "position": pos,
+                     "title": f"{title} Ep. #{ep} (ENSub/JPDub)" if ep >= 10
+                     else f"{title}|E{ep}(ENSub/JPDub) 【Ani-One Philippines】"}
+                    for pos, ep in enumerate(order)
+                ]
+                processor = StubYouTubeDataProcessor(
+                    {"PL": items}, {f"ep{ep}": ep * 100 for ep in order}
+                )
+                result = processor.process_region(
+                    self.make_region_data(["https://www.youtube.com/playlist?list=PL"]),
+                    processor.parse_offset_rule(""),
+                )
+                self.assertEqual(result.first, 100)
+                self.assertEqual(result.total, 2500)
+                self.assertEqual(result.avg, 625)
+                self.assertEqual(result.valid_count, 4)
+
+    def test_manual_first_episode_selection_preserves_totals_and_filters(self):
+        processor = StubYouTubeDataProcessor(
+            {"PL": [
+                {"id": "a", "title": "Episode 1 序章 日語", "position": 0},
+                {"id": "b", "title": "Episode 2 旅程 日語", "position": 1},
+                {"id": "c", "title": "Episode 3 旅程 配音", "position": 2},
+            ]},
+            {"a": 100, "b": 200, "c": 300},
+        )
+        for payload, expected_first, expected_total, expected_count in [
+            ({"first_match": "序章"}, 100, 600, 3),
+            ({"first_match": ["旅程", "日語"]}, 200, 600, 3),
+            ({"first_video_id": "c"}, 300, 600, 3),
+            ({"first_video_id": "c", "first_match": "序章"}, 300, 600, 3),
+            ({"first_video_id": "missing"}, "---", 600, 3),
+            ({"first_match": "missing"}, "---", 600, 3),
+            ({"first_match": "旅程"}, "---", 600, 3),
+            ({"first_video_id": "c", "match": "日語"}, "---", 300, 2),
+            ({"first_video_id": "a", "offset": [2, 3]}, "---", 500, 2),
+        ]:
+            with self.subTest(payload=payload):
+                result = processor.process_region(
+                    self.make_region_data(["https://www.youtube.com/playlist?list=PL"]),
+                    processor.parse_offset_rule(json.dumps(payload)),
+                )
+                self.assertEqual(result.first, expected_first)
+                self.assertEqual(result.total, expected_total)
+                self.assertEqual(result.valid_count, expected_count)
+
+    def test_sheet_updates_use_direct_video_and_region_first_override(self):
+        video_id = "Abc_123-xYz"
+        snapshot = {
+            "row1": ["作品名稱", "總集數", "臺灣｜TW", "", "", "", "", ""],
+            "row2": ["", "", "排名", "平均觀看", "總觀看量", "首集觀看", "連結", "OFFSET"],
+            "rows": [
+                {"row_num": 3, "values": ["電影", "", "", "", "", "", "連結", ""],
+                 "row_signature": "movie", "link_urls_by_col": {"7": [f"https://youtu.be/{video_id}"]}},
+                {"row_num": 4,
+                 "values": ["影集", "", "", "", "", "", "連結", '{"first_video_id":"b"}'],
+                 "row_signature": "series",
+                 "link_urls_by_col": {"7": ["https://www.youtube.com/playlist?list=PL"]}},
+            ],
+        }
+        processor = StubYouTubeDataProcessor(
+            {"PL": [{"id": "a", "title": "Episode 1", "position": 0},
+                    {"id": "b", "title": "Episode 2", "position": 1}]},
+            {video_id: 123, "a": 100, "b": 200},
+        )
+        updates = mod.calculate_sheet_updates(mod.parse_sheet_snapshot("test", snapshot), processor)
+        values = {item["cell"]: item["value"] for row in updates for item in row["value_updates"]}
+        self.assertEqual([values[cell] for cell in ["B3", "D3", "E3", "F3"]], [1, 123, 123, 123])
+        self.assertEqual([values[cell] for cell in ["B4", "D4", "E4", "F4"]], [2, 150, 300, 200])
+
     def test_ignore_keyword_requires_token_boundary_for_short_acronyms(self):
         processor = mod.YouTubeDataProcessor("test-key")
         rule = processor.parse_offset_rule("TVSP")
@@ -70,9 +264,16 @@ class YtViewCountTests(unittest.TestCase):
         mock_get.assert_called_once()
 
     def test_parse_sheet_snapshot_uses_sample_region_layout(self):
-        csv_path = Path("日本動畫 Youtube亞洲新番觀看量｜木棉花 - 2026.04.csv")
-        with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
-            rows = list(csv.reader(fh))
+        regions = [
+            "臺灣｜TW", "香港、澳門｜HK、MO", "亞洲｜ASIA", "印尼｜ID",
+            "汶萊、馬來西亞｜BN、MY", "菲律賓｜PH", "泰國｜TH", "越南｜VN", "印度｜IN",
+        ]
+        row1 = ["作品名稱", "日本窗口", "綜合排名", "總集數"]
+        row2 = [""] * 4
+        for region in regions:
+            row1.extend([region, "", "", "", "", ""])
+            row2.extend(["排名", "平均觀看", "總觀看量", "首集觀看", "連結", "OFFSET"])
+        rows = [row1, row2, ["作品A"] + [""] * (len(row1) - 1)]
 
         snapshot = {
             "row1": rows[0],
@@ -108,9 +309,14 @@ class YtViewCountTests(unittest.TestCase):
         self.assertEqual(model.rows[0].ep_count_cell, "D3")
 
     def test_parse_sheet_snapshot_detects_dynamic_leading_columns_and_multiple_offsets(self):
-        csv_path = Path("日本動畫 Youtube亞洲新番觀看量｜回歸線+曼迪 - 2026.04.csv")
-        with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
-            rows = list(csv.reader(fh))
+        rows = [
+            ["作品名稱", "日本窗口", "代理商", "綜合排名", "總集數", "中文區｜TW+HK+MO",
+             "", "", "", "", "", "", "備註"],
+            ["", "", "", "", "", "排名", "平均觀看", "總觀看量", "首集觀看", "連結",
+             "OFFSET", "OFFSET", ""],
+            ["作品A"] + [""] * 12,
+            ["作品B"] + [""] * 12,
+        ]
 
         snapshot = {
             "row1": rows[0],
