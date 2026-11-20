@@ -45,21 +45,32 @@ def read_positive_int_env(name, default):
         return default
 
 
-def sanitize_log_text(value):
-    """遮蔽已知憑證與資源 ID，避免公開 log 洩漏隱私。"""
-    text = str(value)
-    secrets = [
-        GAS_KEY,
-        YOUTUBE_API_KEY,
-        TG_BOT_TOKEN,
-        TG_CHAT_ID,
-        *SPREADSHEET_IDS,
-    ]
-    for secret in secrets:
-        if secret:
-            text = text.replace(str(secret), "[已隱藏]")
-    text = re.sub(r"([?&]key=)[^&\s]+", r"\1[已隱藏]", text, flags=re.IGNORECASE)
-    return text
+def safe_error_kind(error):
+    """只輸出程式定義的錯誤類別，不使用例外內容、網址或回應本文。"""
+    if isinstance(error, requests.Timeout):
+        return "逾時"
+    if isinstance(error, requests.ConnectionError):
+        return "連線失敗"
+    if isinstance(error, requests.RequestException):
+        return "HTTP 請求失敗"
+    if isinstance(error, ValueError):
+        return "資料格式錯誤"
+    return "處理失敗"
+
+
+def send_heartbeat():
+    if not HEARTBEAT_URL:
+        return
+
+    print("正在發送 Heartbeat...")
+    try:
+        response = requests.get(HEARTBEAT_URL, timeout=30, allow_redirects=False)
+        if 200 <= response.status_code < 300:
+            print("Heartbeat 發送成功")
+        else:
+            print(f"Heartbeat 發送失敗: HTTP {response.status_code}")
+    except Exception as error:
+        print(f"Heartbeat 發送失敗: {safe_error_kind(error)}")
 
 
 # ==========================================
@@ -173,7 +184,7 @@ class AnimeAPI:
 
             result = response.json()
             if result.get("status") != "success":
-                raise Exception(f"API Error: {sanitize_log_text(result.get('message'))}")
+                raise ValueError("Apps Script API 回報操作失敗")
             return result.get("data")
         except json.JSONDecodeError:
             # 回應內容可能包含試算表資料，不直接輸出到公開 log。
@@ -336,7 +347,7 @@ class YouTubeDataProcessor:
             f"超長播放清單阻擋={self.playlists_blocked_by_page_limit}"
         )
         if self.stop_reason:
-            print(f"停止原因: {sanitize_log_text(self.stop_reason)}")
+            print("YouTube API 已停止送出要求。")
         print("註：這是依 API 方法計算的估算值；Google 不會在回應中提供剩餘日額度。")
 
     def _check_quota(self, response):
@@ -1228,8 +1239,8 @@ def calculate_sheet_updates(sheet_model, processor):
     row_has_any_links = {}
 
     # 遍歷區域
-    for region in sheet_model.regions:
-        print(f"\n[{sheet_model.sheet_name}] 正在處理區域: {region.name}")
+    for region_index, region in enumerate(sheet_model.regions, start=1):
+        print(f"\n正在處理第 {region_index} 個區域")
         region_results = []
 
         # --- 第一階段：讀取該區域所有影片數據 ---
@@ -1253,8 +1264,7 @@ def calculate_sheet_updates(sheet_model, processor):
             if region_data.link_urls:
                 row_has_any_links[row.row_num] = True
                 row_payload["_has_links"] = True
-                display_name = row.anime_name.split("\n")[0]
-                print(f"  > 處理: {display_name} ...", end=" ", flush=True)
+                print(f"  > 處理第 {row.row_num} 列 ...", end=" ", flush=True)
                 if rule.invalid_json:
                     print("OFFSET JSON 格式錯誤，改以預設過濾規則繼續。", end=" ", flush=True)
 
@@ -1270,7 +1280,7 @@ def calculate_sheet_updates(sheet_model, processor):
                     if stats.valid_count > row_max_ep_map.get(row.row_num, 0):
                         row_max_ep_map[row.row_num] = stats.valid_count
             elif rule.invalid_json:
-                print(f"  > {row.anime_name.split('\n')[0]} 的 {region.name} OFFSET JSON 格式錯誤，已標紅。")
+                print(f"  > 第 {row.row_num} 列的 OFFSET JSON 格式錯誤，已標紅。")
 
             region_results.append({"row": row, "region_data": region_data, "stats": stats})
 
@@ -1334,13 +1344,16 @@ def send_telegram_error(error_msg):
             "chat_id": TG_CHAT_ID,
             "text": (
                 "[日本動畫 Youtube亞洲新番觀看量]\n發生錯誤:\n\n"
-                f"{sanitize_log_text(error_msg)}"
+                f"{error_msg}"
             ),
         }
-        requests.post(url, json=payload)
-        print("已發送錯誤通知至 Telegram")
+        response = requests.post(url, json=payload, timeout=30, allow_redirects=False)
+        if 200 <= response.status_code < 300:
+            print("已發送錯誤通知至 Telegram")
+        else:
+            print(f"發送 Telegram 失敗: HTTP {response.status_code}")
     except Exception as e:
-        print(f"發送 Telegram 失敗: {sanitize_log_text(e)}")
+        print(f"發送 Telegram 失敗: {safe_error_kind(e)}")
 
 
 def process_single_sheet(sheet_name, gas_api=None, processor=None):
@@ -1348,37 +1361,37 @@ def process_single_sheet(sheet_name, gas_api=None, processor=None):
     gas_api = gas_api or current_gas_api
     processor = processor or yt_processor
 
-    print(f"\n====== 準備處理工作表: {sheet_name} ======")
+    print("\n====== 準備處理工作表 ======")
 
     # 讀取工作表快照
     try:
         snapshot = gas_api.get_sheet_snapshot(sheet_name)
     except Exception as e:
-        print(f"讀取工作表 {sheet_name} 失敗: {sanitize_log_text(e)}")
+        print(f"讀取工作表失敗: {safe_error_kind(e)}")
         return
 
     sheet_model = parse_sheet_snapshot(sheet_name, snapshot)
     if not sheet_model.rows:
-        print(f"工作表 {sheet_name} 無資料或格式錯誤，跳過。")
+        print("工作表無資料或格式錯誤，跳過。")
         return
 
     # 由 Python 端完成所有區塊解析與觀看量計算
     updates_batch = calculate_sheet_updates(sheet_model, processor)
 
     if processor.requests_stopped:
-        print(f"\n[暫停] {processor.stop_reason}，不執行寫入")
+        print("\n[暫停] YouTube API 已停止，不執行寫入")
         return
 
     if not updates_batch:
-        print(f"\n[資訊] 工作表 {sheet_name} 沒有需要更新的資料")
+        print("\n[資訊] 工作表沒有需要更新的資料")
         return
 
     # 批量寫入該工作表，GAS 端會再用 row_signature 做一次並發安全檢查
-    print(f"\n[寫入] 準備寫入 {len(updates_batch)} 筆資料至 {sheet_name}...")
+    print(f"\n[寫入] 準備寫入 {len(updates_batch)} 筆資料...")
     try:
         resp = gas_api.batch_update(sheet_name, updates_batch)
         print(
-            f"[寫入] 完成! 更新數: {resp.get('updated')}, "
+            f"[寫入] 完成! 更新數: {int(resp.get('updated', 0))}, "
             f"衝突: {len(resp.get('conflicts', []))}, 錯誤: {len(resp.get('errors', []))}"
         )
         if resp.get("conflicts"):
@@ -1386,13 +1399,13 @@ def process_single_sheet(sheet_name, gas_api=None, processor=None):
         if resp.get("errors"):
             print("[寫入] 錯誤明細已隱藏，避免公開 log 洩漏試算表內容。")
 
-        if resp.get("updated", 0) > 0:
+        if int(resp.get("updated", 0)) > 0:
             # 只有真的有成功寫入時才排序
-            print(f"[排序] 正在對 {sheet_name} 進行綜合排名排序...")
-            sort_resp = gas_api.sort_data(sheet_name)
-            print(f"[排序] {sanitize_log_text(sort_resp.get('message'))}")
+            print("[排序] 正在進行綜合排名排序...")
+            gas_api.sort_data(sheet_name)
+            print("[排序] 完成")
     except Exception as e:
-        print(f"[寫入/排序] 失敗: {sanitize_log_text(e)}")
+        print(f"[寫入/排序] 失敗: {safe_error_kind(e)}")
 
 
 def main():
@@ -1424,7 +1437,7 @@ def main():
             try:
                 schedule = gas_api.get_schedule()
             except Exception as e:
-                print(f"讀取排程失敗: {sanitize_log_text(e)}")
+                print(f"讀取排程失敗: {safe_error_kind(e)}")
                 raise
 
             # 2. 決定要更新哪些工作表
@@ -1439,7 +1452,7 @@ def main():
                 print("此試算表今天沒有安排需要更新的工作表。")
                 continue
 
-            print(f"今日待更新列表: {target_sheets}")
+            print(f"今日待更新工作表: {len(target_sheets)} 張")
 
             # 3. 逐一處理每個工作表
             for sheet_name in target_sheets:
@@ -1460,18 +1473,7 @@ def main():
         # 捕捉所有執行途中的報錯，傳到 TG
         global_error_occurred = True
 
-        import sys
-        import traceback
-
-        error_class = e.__class__.__name__
-        detail = sanitize_log_text(e.args[0] if e.args else str(e))
-        # 取得詳細錯誤訊息
-        _, _, tb = sys.exc_info()
-        last_call_stack = traceback.extract_tb(tb)[-1]
-        file_name = last_call_stack[0]
-        line_num = last_call_stack[1]
-        func_name = last_call_stack[2]
-        err_msg = f'File "{file_name}", line {line_num}, in {func_name}: [{error_class}] {detail}'
+        err_msg = f"工作表處理失敗: {safe_error_kind(e)}"
         print(f"\n❌ 發生嚴重錯誤: {err_msg}")
         send_telegram_error(err_msg)
 
@@ -1489,29 +1491,24 @@ def main():
             if not ss_id:
                 continue
             api = AnimeAPI(GAS_URL, ss_id)
-            res = api.update_system_time(now_str)
-            print(
-                f"  - 第 {idx + 1} 個試算表: "
-                f"{sanitize_log_text(res.get('message'))}"
-            )
+            api.update_system_time(now_str)
+            print(f"  - 第 {idx + 1} 個試算表: 系統時間已更新")
     except Exception as e:
-        safe_error = sanitize_log_text(e)
+        safe_error = safe_error_kind(e)
         print(f"更新系統時間時發生錯誤: {safe_error}")
         send_telegram_error(f"更新系統時間失敗: {safe_error}")
         yt_processor.print_usage_summary()
         return
 
-    if HEARTBEAT_URL:
-        try:
-            # 發送 Heartbeat
-            print("正在發送 Heartbeat...")
-            requests.get(HEARTBEAT_URL, timeout=30)
-            print("Heartbeat 發送成功")
-        except Exception as e:
-            print(f"Heartbeat 發送失敗: {sanitize_log_text(e)}")
+    send_heartbeat()
 
     yt_processor.print_usage_summary()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        # 避免意外例外的 traceback 在 Actions 公開日誌輸出敏感資料。
+        print(f"執行失敗: {safe_error_kind(error)}")
+        raise SystemExit(1) from None
